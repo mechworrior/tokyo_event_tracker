@@ -1,0 +1,47 @@
+# Daily refresh of data/events_data.js.
+#
+# Note: eplus / l-tike / pia are likely to be bot-blocked from GitHub's
+# datacenter IPs — the merge logic in scraper.py keeps their previous data
+# when a source fails, returns nothing, or shrinks below 50% of its old count.
+name: Scrape Tokyo events
+
+on:
+  schedule:
+    - cron: "0 21 * * *" # 21:00 UTC = 6:00 JST
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+      - name: Scrape
+        run: python scraper.py
+
+      - name: Commit updated data if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/events_data.js
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: refresh events data ($(date -u +%F))"
+            git push
+          else
+            echo "No changes to commit."
+          fi

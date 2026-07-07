@@ -85,3 +85,4 @@ window.EVENTS_PIA = [
 {"t":"Unlucky Morpheus (8/23公演)","d1":"2026/8/23","d2":"2026/8/23","v":"恵比寿ザ・ガーデンホール","st":"","c":"music"},
 {"t":"Unlucky Morpheus (8/1公演)","d1":"2026/8/1","d2":"2026/8/1","v":"渋谷近未来会館","st":"販売期間中","c":"music"}
 ];
+window.EVENTS_META = {"generated": "2026-07-06", "counts": {"cc": 80, "lp": 10, "ep": 36, "lt": 18, "pia": 10}};

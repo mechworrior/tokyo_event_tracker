@@ -11,13 +11,18 @@ Sources:
 
 Usage:
   pip install -r requirements.txt
-  python scraper.py
+  python scraper.py                 # all sources
+  python scraper.py --source cc,lp  # only these; others keep existing data
 Then reload index.html in your browser.
+
+Sources that fail, return nothing, or shrink below 50% of their previous
+count keep their previous data (the existing events_data.js is merged in).
 
 Be polite: this sleeps between requests. Run at most a few times per day.
 Note: eplus/l-tike/pia only expose the first page of results to simple scrapers
 (pagination is JS-driven), so those sources yield a curated top slice, not everything.
 """
+import argparse
 import json
 import re
 import time
@@ -33,13 +38,20 @@ TODAY = datetime.date.today()
 OUT_FILE = Path(__file__).resolve().parent / "data" / "events_data.js"
 
 
-def get(url):
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    time.sleep(SLEEP)
-    if r.status_code != 200:
-        print(f"  ! {r.status_code} {url}")
-        return None
-    return r.text
+def get(url, tries=2, backoff=3.0):
+    """GET with a simple retry + backoff. Returns page text or None."""
+    for attempt in range(1, tries + 1):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            time.sleep(SLEEP)
+            if r.status_code == 200:
+                return r.text
+            print(f"  ! {r.status_code} {url}")
+        except requests.RequestException as e:
+            print(f"  ! {type(e).__name__} {url}")
+        if attempt < tries:
+            time.sleep(backoff * attempt)
+    return None
 
 
 # ---------------- collabo-cafe ----------------
@@ -277,29 +289,106 @@ def scrape_pia():
     return rows
 
 
-def main():
-    print("Scraping collabo-cafe.com (Tokyo)...")
-    cc = scrape_collabocafe()
-    print(f"→ {len(cc)} events\n")
-    print("Scraping LivePocket (Tokyo, upcoming)...")
-    lp = scrape_livepocket()
-    print(f"→ {len(lp)} events\n")
-    print("Scraping eplus (Tokyo, on-sale)...")
-    ep = scrape_eplus()
-    print(f"→ {len(ep)} events\n")
-    print("Scraping l-tike...")
-    lt = scrape_ltike()
-    print("Scraping pia...")
-    pia = scrape_pia()
+# ---------------- merge / write ----------------
+# source key -> (JS global suffix, scrape function)
+SOURCES = {
+    "cc": ("CC", scrape_collabocafe),
+    "lp": ("LP", scrape_livepocket),
+    "ep": ("EP", scrape_eplus),
+    "lt": ("LT", scrape_ltike),
+    "pia": ("PIA", scrape_pia),
+}
+KEEP_RATIO = 0.5  # keep old data if new scrape yields < 50% of previous count
 
-    OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(OUT_FILE, "w", encoding="utf-8") as f:
-        f.write(f"// Tokyo Events data — generated {TODAY.isoformat()} by scraper.py\n")
-        f.write("window.EVENTS_CC = " + json.dumps(cc, ensure_ascii=False) + ";\n")
-        f.write("window.EVENTS_LP = " + json.dumps(lp, ensure_ascii=False) + ";\n")
-        f.write("window.EVENTS_EP = " + json.dumps(ep, ensure_ascii=False) + ";\n")
-        f.write("window.EVENTS_LT = " + json.dumps(lt, ensure_ascii=False) + ";\n")
-        f.write("window.EVENTS_PIA = " + json.dumps(pia, ensure_ascii=False) + ";\n")
+
+def load_existing(path):
+    """Parse window.EVENTS_XX arrays out of an existing events_data.js.
+
+    Returns {source_key: list}. Missing file / unparseable arrays are simply
+    absent from the result. Handles multi-line arrays.
+    """
+    path = Path(path)
+    out = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return out
+    dec = json.JSONDecoder()
+    for key, (suffix, _) in SOURCES.items():
+        m = re.search(r"window\.EVENTS_%s\s*=\s*" % suffix, text)
+        if not m:
+            continue
+        try:
+            val, _end = dec.raw_decode(text, m.end())
+        except ValueError:
+            continue
+        if isinstance(val, list):
+            out[key] = val
+    return out
+
+
+def choose(old, new, name=""):
+    """Pick new data unless the scrape failed/shrank badly; then keep old."""
+    old = old or []
+    if new is None:
+        print(f"  ! {name}: scrape failed — keeping previous {len(old)} events")
+        return old
+    if old and len(new) == 0:
+        print(f"  ! {name}: scrape returned 0 events — keeping previous {len(old)}")
+        return old
+    if old and len(new) < KEEP_RATIO * len(old):
+        print(f"  ! {name}: only {len(new)} events (was {len(old)}) — keeping previous data")
+        return old
+    return new
+
+
+def write_data(path, data, meta):
+    """Write data/events_data.js. data = {source_key: list}, meta = dict."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"// Tokyo Events data — generated {meta.get('generated', '')} by scraper.py\n")
+        for key, (suffix, _) in SOURCES.items():
+            f.write(f"window.EVENTS_{suffix} = "
+                    + json.dumps(data.get(key, []), ensure_ascii=False) + ";\n")
+        f.write("window.EVENTS_META = " + json.dumps(meta, ensure_ascii=False) + ";\n")
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="Refresh data/events_data.js")
+    ap.add_argument("--source", default=",".join(SOURCES),
+                    help="comma-separated sources to scrape (%s); others keep "
+                         "existing data" % ",".join(SOURCES))
+    return ap.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    wanted = [s.strip() for s in args.source.split(",") if s.strip()]
+    bad = [s for s in wanted if s not in SOURCES]
+    if bad:
+        raise SystemExit(f"unknown source(s): {', '.join(bad)} (valid: {', '.join(SOURCES)})")
+
+    existing = load_existing(OUT_FILE)
+    merged = {}
+    for key, (_, scrape) in SOURCES.items():
+        old = existing.get(key, [])
+        if key not in wanted:
+            print(f"{key}: not requested — keeping existing {len(old)} events")
+            merged[key] = old
+            continue
+        print(f"Scraping {key}...")
+        try:
+            new = scrape()
+        except Exception as e:
+            print(f"  ! {key} scrape crashed: {type(e).__name__}: {e}")
+            new = None
+        merged[key] = choose(old, new, key)
+        print(f"→ {key}: {len(merged[key])} events\n")
+
+    meta = {"generated": TODAY.isoformat(),
+            "counts": {k: len(v) for k, v in merged.items()}}
+    write_data(OUT_FILE, merged, meta)
     print(f"Wrote {OUT_FILE} — reload index.html")
 
 
